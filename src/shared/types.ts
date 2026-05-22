@@ -1360,6 +1360,9 @@ export type CodexManagedAccount = {
   id: string
   email: string
   managedHomePath: string
+  managedHomeRuntime?: 'host' | 'wsl'
+  wslDistro?: string | null
+  wslLinuxHomePath?: string | null
   providerAccountId?: string | null
   workspaceLabel?: string | null
   workspaceAccountId?: string | null
@@ -1371,6 +1374,8 @@ export type CodexManagedAccount = {
 export type CodexManagedAccountSummary = {
   id: string
   email: string
+  managedHomeRuntime?: 'host' | 'wsl'
+  wslDistro?: string | null
   providerAccountId?: string | null
   workspaceLabel?: string | null
   workspaceAccountId?: string | null

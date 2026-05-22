@@ -690,7 +690,7 @@ function Settings(): React.JSX.Element {
     [activeSectionId, mountedSectionIds, navSections, settingsSearchQuery, visibleSectionIds]
   )
   const windowsTerminalCapabilities = useWindowsTerminalCapabilities(
-    isWindows && neededSectionIds.has('terminal')
+    isWindows && (neededSectionIds.has('terminal') || neededSectionIds.has('accounts'))
   )
 
   useEffect(() => {
@@ -995,7 +995,13 @@ function Settings(): React.JSX.Element {
                   searchEntries={ACCOUNTS_PANE_SEARCH_ENTRIES}
                 >
                   {isSectionMounted('accounts') ? (
-                    <AccountsPane settings={settings} updateSettings={updateSettings} />
+                    <AccountsPane
+                      settings={settings}
+                      updateSettings={updateSettings}
+                      wslAvailable={windowsTerminalCapabilities.wslAvailable}
+                      wslDistros={windowsTerminalCapabilities.wslDistros}
+                      wslCapabilitiesLoading={windowsTerminalCapabilities.isLoading}
+                    />
                   ) : null}
                 </SettingsSection>
 

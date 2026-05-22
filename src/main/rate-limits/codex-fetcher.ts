@@ -5,6 +5,7 @@ import type { ProviderRateLimits, RateLimitWindow } from '../../shared/rate-limi
 import { spawn } from 'node:child_process'
 import { resolveCodexCommand } from '../codex-cli/command'
 import { getCmdExePath, getSpawnArgsForWindows } from '../win32-utils'
+import { parseWslUncPath } from '../../shared/wsl-paths'
 
 const RPC_TIMEOUT_MS = 10_000
 const PTY_TIMEOUT_MS = 15_000
@@ -38,6 +39,37 @@ type RpcRateLimitsResult = {
 // The actual response shape is `{ rateLimits: { primary, secondary, ... } }`.
 type RpcRateLimitsResponse = {
   rateLimits?: RpcRateLimitsResult
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`
+}
+
+function buildWslCodexCommand(
+  codexHomePath: string,
+  args: string[]
+): {
+  command: string
+  args: string[]
+} | null {
+  const wslInfo = parseWslUncPath(codexHomePath)
+  if (process.platform !== 'win32' || !wslInfo) {
+    return null
+  }
+  const script = [
+    `export CODEX_HOME=${shellQuote(wslInfo.linuxPath)}`,
+    `exec codex ${args.map(shellQuote).join(' ')}`
+  ].join('; ')
+  return {
+    command: 'wsl.exe',
+    args: ['-d', wslInfo.distro, '--', 'bash', '-lc', script]
+  }
+}
+
+function cloneProcessEnvWithoutCodexHome(): NodeJS.ProcessEnv {
+  const env = { ...process.env }
+  delete env.CODEX_HOME
+  return env
 }
 
 function buildRpcMessage(id: number, method: string, params?: unknown): string {
@@ -91,18 +123,18 @@ async function fetchViaRpc(options?: FetchCodexRateLimitsOptions): Promise<Provi
     let resolved = false
     let rpcId = 0
 
-    const codexCommand = resolveCodexCommand()
+    const codexArgs = ['-s', 'read-only', '-a', 'untrusted', 'app-server']
+    const wslCodex = options?.codexHomePath
+      ? buildWslCodexCommand(options.codexHomePath, codexArgs)
+      : null
+    const codexCommand = wslCodex ? 'codex' : resolveCodexCommand()
     // Why: on Windows, resolveCodexCommand() may return a .cmd/.bat file.
     // spawn() cannot execute batch scripts directly without shell:true, but
     // shell:true with an args array triggers DEP0190 (args are concatenated,
     // not escaped). Fix: detect batch scripts and route through cmd.exe /c.
-    const { spawnCmd, spawnArgs } = getSpawnArgsForWindows(codexCommand, [
-      '-s',
-      'read-only',
-      '-a',
-      'untrusted',
-      'app-server'
-    ])
+    const { spawnCmd, spawnArgs } = wslCodex
+      ? { spawnCmd: wslCodex.command, spawnArgs: wslCodex.args }
+      : getSpawnArgsForWindows(codexCommand, codexArgs)
     const child = spawn(spawnCmd, spawnArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
       // Why: the selected Codex rate-limit account must only affect this fetch
@@ -113,8 +145,8 @@ async function fetchViaRpc(options?: FetchCodexRateLimitsOptions): Promise<Provi
       // poll on Windows.
       windowsHide: true,
       env: {
-        ...process.env,
-        ...(options?.codexHomePath ? { CODEX_HOME: options.codexHomePath } : {})
+        ...(wslCodex ? cloneProcessEnvWithoutCodexHome() : process.env),
+        ...(options?.codexHomePath && !wslCodex ? { CODEX_HOME: options.codexHomePath } : {})
       }
     })
 
@@ -306,7 +338,8 @@ function parsePtyStatus(output: string): {
 
 async function fetchViaPty(options?: FetchCodexRateLimitsOptions): Promise<ProviderRateLimits> {
   const pty = await import('node-pty')
-  const codexCommand = resolveCodexCommand()
+  const wslCodex = options?.codexHomePath ? buildWslCodexCommand(options.codexHomePath, []) : null
+  const codexCommand = wslCodex ? 'codex' : resolveCodexCommand()
 
   // Why: node-pty cannot spawn .cmd/.bat batch scripts directly on Windows —
   // those need cmd.exe as an interpreter. resolveCodexCommand() may also fall
@@ -316,8 +349,8 @@ async function fetchViaPty(options?: FetchCodexRateLimitsOptions): Promise<Provi
   // even for bare 'codex' (not just .cmd/.bat) to let PATHEXT resolution
   // succeed under a minimal Electron PATH. /d matches the rest of the codebase.
   const isWin32 = process.platform === 'win32'
-  const spawnFile = isWin32 ? getCmdExePath() : codexCommand
-  const spawnArgs = isWin32 ? ['/d', '/c', codexCommand] : []
+  const spawnFile = wslCodex ? wslCodex.command : isWin32 ? getCmdExePath() : codexCommand
+  const spawnArgs = wslCodex ? wslCodex.args : isWin32 ? ['/d', '/c', codexCommand] : []
 
   return new Promise<ProviderRateLimits>((resolve) => {
     let output = ''
@@ -329,9 +362,9 @@ async function fetchViaPty(options?: FetchCodexRateLimitsOptions): Promise<Provi
       cols: 120,
       rows: 40,
       env: {
-        ...process.env,
+        ...(wslCodex ? cloneProcessEnvWithoutCodexHome() : process.env),
         TERM: 'xterm-256color',
-        ...(options?.codexHomePath ? { CODEX_HOME: options.codexHomePath } : {})
+        ...(options?.codexHomePath && !wslCodex ? { CODEX_HOME: options.codexHomePath } : {})
       }
     })
     const termDisposables: { dispose: () => void }[] = []

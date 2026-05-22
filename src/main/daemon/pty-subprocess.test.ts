@@ -816,6 +816,50 @@ describe('createPtySubprocess', () => {
     )
   })
 
+  it('routes daemon default WSL terminals to the Codex home distro without losing cwd', () => {
+    const proc = mockPtyProcess()
+    spawnMock.mockReturnValue(proc)
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')
+    const cwd = mkdtempSync(join(tmpdir(), 'daemon-pty-wsl-codex-home-cwd-'))
+
+    Object.defineProperty(process, 'platform', { value: 'win32' })
+
+    try {
+      createPtySubprocess({
+        sessionId: 'test',
+        cols: 80,
+        rows: 24,
+        cwd,
+        shellOverride: 'wsl.exe',
+        env: {
+          CODEX_HOME:
+            '\\\\wsl.localhost\\Ubuntu\\home\\jin\\.local\\share\\orca\\codex-accounts\\a\\home'
+        }
+      })
+    } finally {
+      if (platform) {
+        Object.defineProperty(process, 'platform', platform)
+      }
+      rmSync(cwd, { recursive: true, force: true })
+    }
+
+    const normalizedCwd = cwd.replace(/\\/g, '/')
+    const driveMatch = normalizedCwd.match(/^([A-Za-z]):\/?(.*)$/)
+    const expectedLinuxCwd = driveMatch
+      ? `/mnt/${driveMatch[1].toLowerCase()}${driveMatch[2] ? `/${driveMatch[2]}` : ''}`
+      : '/mnt/c'
+
+    expect(spawnMock).toHaveBeenCalledWith(
+      'wsl.exe',
+      ['-d', 'Ubuntu', '--', 'bash', '-c', `cd '${expectedLinuxCwd}' && exec bash -l`],
+      expect.objectContaining({
+        env: expect.objectContaining({
+          CODEX_HOME: '/home/jin/.local/share/orca/codex-accounts/a/home'
+        })
+      })
+    )
+  })
+
   it('preserves an explicit Linux Codex home in daemon WSL terminals', () => {
     const proc = mockPtyProcess()
     spawnMock.mockReturnValue(proc)

@@ -31,7 +31,7 @@ import {
   STARTUP_COMMAND_READY_MAX_WAIT_MS
 } from './local-pty-shell-ready'
 import { removeInheritedNoColor } from '../pty/terminal-color-env'
-import { isHostCodexHomeForWsl } from '../pty/codex-home-wsl-env'
+import { isHostCodexHomeForWsl, isWslCodexHomeForHost } from '../pty/codex-home-wsl-env'
 
 const PANE_IDENTITY_ENV_KEYS = ['ORCA_PANE_KEY', 'ORCA_TAB_ID', 'ORCA_WORKTREE_ID'] as const
 
@@ -282,14 +282,34 @@ export class LocalPtyProvider implements IPtyProvider {
     }
 
     const finalEnv = this.opts.buildSpawnEnv ? this.opts.buildSpawnEnv(id, spawnEnv) : spawnEnv
-    if (
-      process.platform === 'win32' &&
-      pathWin32.basename(shellPath).toLowerCase() === 'wsl.exe' &&
-      isHostCodexHomeForWsl(finalEnv.CODEX_HOME)
-    ) {
-      // Why: Orca's selected Codex runtime home is host-local. WSL Codex must
-      // use its Linux-side ~/.codex instead of inheriting a Windows path.
-      delete finalEnv.CODEX_HOME
+    if (process.platform === 'win32') {
+      const codexHomeWslInfo = finalEnv.CODEX_HOME ? parseWslPath(finalEnv.CODEX_HOME) : null
+      if (pathWin32.basename(shellPath).toLowerCase() === 'wsl.exe') {
+        if (codexHomeWslInfo) {
+          const launchWslDistro = wslInfo?.distro ?? worktreeWslContext?.distro
+          if (launchWslDistro && launchWslDistro !== codexHomeWslInfo.distro) {
+            delete finalEnv.CODEX_HOME
+          } else {
+            finalEnv.CODEX_HOME = codexHomeWslInfo.linuxPath
+            if (!launchWslDistro) {
+              const resolved = resolveWindowsShellLaunchArgs(shellPath, cwd, defaultCwd, {
+                distro: codexHomeWslInfo.distro
+              })
+              shellArgs = resolved.shellArgs
+              effectiveCwd = resolved.effectiveCwd
+              validationCwd = resolved.validationCwd
+            }
+          }
+        } else if (isHostCodexHomeForWsl(finalEnv.CODEX_HOME)) {
+          // Why: Orca's selected Codex runtime home is host-local. WSL Codex
+          // must use its Linux-side ~/.codex instead of a Windows path.
+          delete finalEnv.CODEX_HOME
+        }
+      } else if (codexHomeWslInfo || isWslCodexHomeForHost(finalEnv.CODEX_HOME)) {
+        // Why: WSL-managed Codex homes are Linux paths. Windows Codex cannot use
+        // them, so host shells should fall back to their host-side system auth.
+        delete finalEnv.CODEX_HOME
+      }
     }
     if (!wslInfo && process.platform !== 'win32') {
       // Why: any Orca-injected overlay env that user rc files can clobber
