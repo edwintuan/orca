@@ -8,6 +8,7 @@ import {
   getTerminalHtmlFileOpenHint,
   handleOscLink,
   isTerminalLinkActivation,
+  openFilePathLinkAtBufferPosition,
   openDetectedFilePath
 } from './terminal-link-handlers'
 import { registerHttpLinkStoreAccessor } from '@/lib/http-link-routing'
@@ -522,27 +523,65 @@ describe('handleOscLink', () => {
 })
 
 describe('createFilePathLinkProvider range bounds', () => {
-  function makePane(lineText: string): { id: number; terminal: unknown } {
+  type TestBufferLine = {
+    isWrapped: boolean
+    length: number
+    translateToString: (
+      trimRight?: boolean,
+      startColumn?: number,
+      endColumn?: number,
+      outColumns?: number[]
+    ) => string
+  }
+
+  function defaultColumnsForText(text: string): number[] {
+    return Array.from({ length: text.length + 1 }, (_value, index) => index)
+  }
+
+  function makeBufferLine(
+    text: string,
+    options: { isWrapped?: boolean; columns?: number[] } = {}
+  ): TestBufferLine {
+    const columns = options.columns ?? defaultColumnsForText(text)
+    return {
+      isWrapped: options.isWrapped ?? false,
+      length: text.length,
+      translateToString: (
+        _trimRight?: boolean,
+        startColumn = 0,
+        endColumn = text.length,
+        outColumns?: number[]
+      ) => {
+        if (outColumns) {
+          outColumns.length = 0
+          for (let index = startColumn; index <= endColumn; index++) {
+            outColumns.push(columns[index] ?? index)
+          }
+        }
+        return text.slice(startColumn, endColumn)
+      }
+    }
+  }
+
+  function makePane(rows: TestBufferLine[]): { id: number; terminal: unknown } {
     return {
       id: 1,
       terminal: {
         buffer: {
           active: {
-            getLine: (_y: number) => ({
-              translateToString: (_trim: boolean) => lineText
-            })
+            getLine: (y: number) => rows[y]
           }
         }
       }
     }
   }
 
-  function collectLinks(lineText: string): Promise<ILink[]> {
-    const pane = makePane(lineText)
+  function createProvider(rows: TestBufferLine[]) {
+    const pane = makePane(rows)
     const managerRef = {
       current: { getPanes: () => [pane] } as unknown as PaneManager
     }
-    const provider = createFilePathLinkProvider(
+    return createFilePathLinkProvider(
       1,
       {
         worktreeId: 'wt-1',
@@ -558,9 +597,42 @@ describe('createFilePathLinkProvider range bounds', () => {
       { textContent: '', style: { display: '' } } as unknown as HTMLElement,
       'hint'
     )
+  }
+
+  function collectLinks(
+    rowsOrText: TestBufferLine[] | string,
+    bufferLineNumber = 1
+  ): Promise<ILink[]> {
+    const rows = typeof rowsOrText === 'string' ? [makeBufferLine(rowsOrText)] : rowsOrText
+    const provider = createProvider(rows)
     return new Promise<ILink[]>((resolve) => {
-      provider.provideLinks(1, (links) => resolve(links ?? []))
+      provider.provideLinks(bufferLineNumber, (links) => resolve(links ?? []))
     })
+  }
+
+  function containsBufferPoint(link: ILink, x: number, y: number): boolean {
+    const { start, end } = link.range
+    if (y < start.y || y > end.y) {
+      return false
+    }
+    if (start.y === end.y) {
+      return x >= start.x && x <= end.x
+    }
+    if (y === start.y) {
+      return x >= start.x
+    }
+    if (y === end.y) {
+      return x <= end.x
+    }
+    return true
+  }
+
+  function makeBuffer(
+    rows: TestBufferLine[]
+  ): Parameters<typeof openFilePathLinkAtBufferPosition>[0] {
+    return { getLine: (y: number) => rows[y] } as Parameters<
+      typeof openFilePathLinkAtBufferPosition
+    >[0]
   }
 
   it('underlines only the filename itself, not the column padding from `ls`', async () => {
@@ -584,5 +656,153 @@ describe('createFilePathLinkProvider range bounds', () => {
     const pkgStartIndex = line.indexOf('package.json')
     expect(pkg!.range.start.x).toBe(pkgStartIndex + 1)
     expect(pkg!.range.end.x).toBe(pkgStartIndex + 'package.json'.length)
+  })
+
+  it('opens a single-row file path from a direct modifier-click fallback', async () => {
+    setPlatform('Macintosh')
+    const pathExists = createDeferred<boolean>()
+    vi.mocked(window.api.shell.pathExists).mockImplementation(() => pathExists.promise)
+
+    const opened = openFilePathLinkAtBufferPosition(
+      makeBuffer([makeBufferLine('package.json')]),
+      { x: 4, y: 1 },
+      80,
+      {
+        startupCwd: '/tmp',
+        worktreeId: 'wt-1',
+        worktreePath: '/tmp',
+        runtimeEnvironmentId: null
+      }
+    )
+    await flushAsyncWork()
+
+    expect(opened).toBe(true)
+    // Why: direct click fallback cannot wait for xterm's hover-time async
+    // existence probe; openDetectedFilePath still stats before routing.
+    expect(window.api.shell.pathExists).not.toHaveBeenCalled()
+    expect(openFileMock).toHaveBeenCalledWith(
+      expect.objectContaining({ filePath: '/tmp/package.json' })
+    )
+  })
+
+  it('opens a wrapped continuation-row html path from a direct modifier-click fallback', async () => {
+    setPlatform('Macintosh')
+    const rows = [
+      makeBufferLine('open mobile/mock-'),
+      makeBufferLine('homepage.html', { isWrapped: true })
+    ]
+
+    const opened = openFilePathLinkAtBufferPosition(
+      makeBuffer(rows),
+      { x: 'home'.length, y: 2 },
+      20,
+      {
+        startupCwd: '/tmp',
+        worktreeId: 'wt-1',
+        worktreePath: '/tmp',
+        runtimeEnvironmentId: null
+      }
+    )
+    await flushAsyncWork()
+
+    expect(opened).toBe(true)
+    expect(createBrowserTabMock).toHaveBeenCalledWith(
+      'wt-1',
+      'file:///tmp/mobile/mock-homepage.html',
+      expect.objectContaining({ title: 'mock-homepage.html', activate: true })
+    )
+  })
+
+  it('returns a wrapped file link when hovering the first physical row', async () => {
+    const rows = [
+      makeBufferLine('open src/components/'),
+      makeBufferLine('terminal-link-handlers.ts', { isWrapped: true })
+    ]
+
+    const links = await collectLinks(rows, 1)
+    const link = links.find(
+      (candidate) => candidate.text === 'src/components/terminal-link-handlers.ts'
+    )
+
+    expect(link, 'wrapped path should be linkified from the first row').toBeDefined()
+    expect(link!.range).toEqual({
+      start: { x: 'open '.length + 1, y: 1 },
+      end: { x: 'terminal-link-handlers.ts'.length, y: 2 }
+    })
+  })
+
+  it('returns the same wrapped file link when hovering the continuation row', async () => {
+    const rows = [
+      makeBufferLine('open src/components/'),
+      makeBufferLine('terminal-link-handlers.ts', { isWrapped: true })
+    ]
+
+    const firstRowLinks = await collectLinks(rows, 1)
+    const continuationLinks = await collectLinks(rows, 2)
+    const firstRowLink = firstRowLinks.find(
+      (candidate) => candidate.text === 'src/components/terminal-link-handlers.ts'
+    )
+    const continuationLink = continuationLinks.find(
+      (candidate) => candidate.text === 'src/components/terminal-link-handlers.ts'
+    )
+
+    expect(
+      continuationLink,
+      'wrapped path should be linkified from the continuation row'
+    ).toBeDefined()
+    expect(continuationLink!.text).toBe(firstRowLink!.text)
+    expect(continuationLink!.range).toEqual(firstRowLink!.range)
+  })
+
+  it('maps file link columns through multi-code-unit characters before the path', async () => {
+    const text = 'e\u0301 src/main.ts'
+    const columns = [0, 0, 1]
+    for (let index = 3; index < text.length; index++) {
+      columns[index] = index - 1
+    }
+    columns[text.length] = text.length - 1
+
+    const links = await collectLinks([makeBufferLine(text, { columns })])
+    const link = links.find((candidate) => candidate.text === 'src/main.ts')
+
+    expect(link, 'unicode-prefixed path should be linkified').toBeDefined()
+    expect(link!.range.start.x).toBe(3)
+    expect(link!.range.end.x).toBe(text.length - 1)
+  })
+
+  it('drops stale async file links when wrapped rows change before existence resolves', async () => {
+    const rows = [
+      makeBufferLine('open src/components/'),
+      makeBufferLine('terminal-link-handlers.ts', { isWrapped: true })
+    ]
+    const provider = createProvider(rows)
+    const exists = createDeferred<boolean>()
+    vi.mocked(window.api.shell.pathExists).mockImplementation(() => exists.promise)
+    const callback = vi.fn()
+
+    provider.provideLinks(1, callback)
+    rows[0] = makeBufferLine('changed src/other/')
+
+    exists.resolve(true)
+    await flushAsyncWork()
+    await flushAsyncWork()
+
+    expect(callback).not.toHaveBeenCalled()
+  })
+
+  it('reports multi-row ranges that hit-test at wrapped-link boundaries', async () => {
+    const rows = [
+      makeBufferLine('trace src/very/long/'),
+      makeBufferLine('nested/file.ts done', { isWrapped: true })
+    ]
+
+    const links = await collectLinks(rows, 2)
+    const link = links.find((candidate) => candidate.text === 'src/very/long/nested/file.ts')
+
+    expect(link, 'multi-row path should be linkified').toBeDefined()
+    expect(containsBufferPoint(link!, 'trace '.length, 1)).toBe(false)
+    expect(containsBufferPoint(link!, 'trace '.length + 1, 1)).toBe(true)
+    expect(containsBufferPoint(link!, 'nested/file.ts'.length, 2)).toBe(true)
+    expect(containsBufferPoint(link!, 'nested/file.ts'.length + 1, 2)).toBe(false)
   })
 })
